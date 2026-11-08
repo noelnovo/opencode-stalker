@@ -1,0 +1,14 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.*
+*credentials*.json
+*service-account*.json
+google-services.json
+*.key
+*.pem
+*.p12
+*.jks
+*.log
+coverage/

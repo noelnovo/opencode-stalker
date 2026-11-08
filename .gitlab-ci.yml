@@ -1,0 +1,13 @@
+stages: [test]
+plugin-tests:
+  image: node:24-slim
+  stage: test
+  script:
+    - npm test
+public-content-audit:
+  image: python:3.13-slim
+  stage: test
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
+  script:
+    - python3 scripts/audit-public.py

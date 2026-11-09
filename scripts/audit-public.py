@@ -12,6 +12,7 @@ ALLOWED = {
     "tests/stalker-plugin.test.mjs", "scripts/audit-public.py",
 }
 PATTERNS = [
+    r"\bstalker_[A-Za-z0-9_-]{43}\b",
     r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
     r"\b(?:ghp_|github_pat_|glpat-|hvs\.)[A-Za-z0-9_.-]{12,}",
     r"\bAIza[A-Za-z0-9_-]{30,}",
@@ -46,7 +47,8 @@ def main():
             raise ValueError("non_regular_source")
         scan(path.read_bytes())
     version = (ROOT / "VERSION").read_text().strip()
-    if version != "0.3.1" or json.loads((ROOT / "package.json").read_text())["version"] != version:
+    if version != "0.3.2" or any(json.loads((ROOT / name).read_text())["version"] != version
+        for name in ["package.json", "plugin/package.json"]):
         raise ValueError("manifest_version_mismatch")
     history = git("rev-list", "--all", "--parents").decode().splitlines()
     # This extraction begins with one new root commit, never a monorepo parent.

@@ -9,6 +9,43 @@ const KEY = Symbol.for("downops.stalker.direct.v1")
 const hash = (value) => createHash("sha256").update(value).digest("hex")
 export const eventID = (directory, formID) => hash(JSON.stringify(["stalker-direct-v1", directory, formID]))
 
+const validTopic = (value) => typeof value === "string" && value.length === 51 && /^stalker_[A-Za-z0-9_-]{43}$/.test(value)
+const validToken = (value) => typeof value === "string" && value.length >= 20 && value.length <= 4096 && !/[^A-Za-z0-9_:.-]/.test(value)
+const validID = (value) => typeof value === "string" && value.length >= 1 && value.length <= 128 && !/[^A-Za-z0-9_-]/.test(value)
+const has = (value, key) => Object.hasOwn(value, key)
+
+// Select once per installation, independent of registry order. A disabled or
+// conflicting registration fails closed; a present topic never falls back to
+// a stale token. Route values are private and must never enter receipts/logs.
+export function selectDevices(records) {
+  if (!Array.isArray(records) || records.length > 100) throw new Error("devices_invalid")
+  const groups = new Map()
+  for (const record of records) {
+    if (!record || record.schema !== 1 || record.package !== PACKAGE ||
+        !validID(record.device_id)) continue
+    const group = groups.get(record.device_id) ?? []
+    group.push(record)
+    groups.set(record.device_id, group)
+  }
+  const selected = [], routes = new Set()
+  for (const group of groups.values()) {
+    if (group.some((record) => record.enabled !== true)) continue
+    const topics = group.filter((record) => has(record, "topic"))
+    const kind = topics.length ? "topic" : "token"
+    const candidates = topics.length ? topics : group
+    const valid = kind === "topic" ? validTopic : validToken
+    if (candidates.some((record) => !valid(record[kind]))) continue
+    const values = new Set(candidates.map((record) => record[kind]))
+    if (values.size !== 1) continue
+    const value = values.values().next().value
+    const route = `${kind}:${value}`
+    if (routes.has(route)) continue
+    routes.add(route)
+    selected.push({ [kind]: value })
+  }
+  return selected
+}
+
 // Google responses are never logged; cap bodies as well as network duration.
 async function request(url, options, signal, fetcher) {
   const response = await fetcher(url, { ...options,
@@ -43,12 +80,15 @@ export async function readCredentials(path) {
       account.type !== "service_account" || typeof account.client_email !== "string" ||
       typeof account.private_key !== "string" || account.private_key.length > 16384 ||
       !Array.isArray(devices) || devices.length > 100) throw new Error("credentials_invalid")
-  return { account, devices: devices.filter((d) => d.enabled === true && d.schema === 1 &&
-    d.package === PACKAGE && typeof d.token === "string" && d.token.length >= 20 && d.token.length <= 4096) }
+  return { account, devices }
 }
 
-export function message(token, id, expires, now = Date.now()) {
-  return { message: { token, data: { schema: "1", kind: "question", event_id: id },
+export function message(target, id, expires, now = Date.now()) {
+  if (!target || (has(target, "topic") ? !validTopic(target.topic) || has(target, "token") : !validToken(target.token)) ||
+      !validID(id) ||
+      !Number.isFinite(expires) || !Number.isFinite(now)) throw new Error("message_invalid")
+  const route = has(target, "topic") ? { topic: target.topic } : { token: target.token }
+  return { message: { ...route, data: { schema: "1", kind: "question", event_id: id },
     android: { priority: "HIGH", ttl: `${Math.max(0, Math.min(300, Math.floor((expires - now) / 1000)))}s`,
       restricted_package_name: PACKAGE } } }
 }
@@ -61,7 +101,8 @@ export class DirectSender {
     this.disabled = new Set()
   }
   async send(item, signal) {
-    const { account, devices } = await this.credentials()
+    const { account, devices: records } = await this.credentials()
+    const devices = selectDevices(records)
     const fingerprint = hash(account.private_key)
     if (!this.token || this.token.fingerprint !== fingerprint || this.token.expires <= Date.now()) {
       const encode = (v) => Buffer.from(JSON.stringify(v)).toString("base64url")
@@ -81,14 +122,14 @@ export class DirectSender {
     let status = 204
     for (const device of devices) {
       if (signal.aborted || item.expires <= Date.now()) return 410
-      const key = hash(device.token)
-      if (this.disabled.has(key)) continue
+      const key = device.token ? hash(device.token) : undefined
+      if (key && this.disabled.has(key)) continue
       const result = await request("https://fcm.googleapis.com/v1/projects/example-project/messages:send", {
         method: "POST", headers: { Authorization: `Bearer ${this.token.value}`, "Content-Type": "application/json" },
-        body: JSON.stringify(message(device.token, item.id, item.expires)) }, signal, this.fetcher)
+        body: JSON.stringify(message(device, item.id, item.expires)) }, signal, this.fetcher)
       status = result.status
       if (status === 401) this.token = undefined
-      if (result.body.error?.details?.some((d) => d.errorCode === "UNREGISTERED")) {
+      if (key && result.body.error?.details?.some((d) => d.errorCode === "UNREGISTERED")) {
         if (this.disabled.size >= 100) this.disabled.delete(this.disabled.values().next().value)
         this.disabled.add(key)
       }
@@ -208,7 +249,7 @@ export async function setup(ctx, identityReader = readManagedIdentity) {
         }
       } catch {} finally { cleanup() }
     })()
-    console.info(JSON.stringify({ stalker: "direct-fcm", state: "subscribed", version: "0.3.1", guard: "managed-v1", pid: process.pid }))
+    console.info(JSON.stringify({ stalker: "direct-fcm", state: "subscribed", version: "0.3.2", guard: "managed-v1", pid: process.pid }))
     return cleanup
 }
 

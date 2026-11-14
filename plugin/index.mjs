@@ -3,9 +3,10 @@ import { lstat, readFile } from "node:fs/promises"
 import { isManagedServer, readManagedIdentity } from "./identity.mjs"
 
 const TYPES = new Set(["form.created", "form.replied", "form.cancelled"])
+const EXECUTION = "session.execution."
 const PACKAGE = "com.example.dev"
 const TTL = 300000
-const KEY = Symbol.for("downops.stalker.direct.v1")
+const KEY = Symbol.for("downops.stalker.direct.v2")
 const hash = (value) => createHash("sha256").update(value).digest("hex")
 export const eventID = (directory, formID) => hash(JSON.stringify(["stalker-direct-v1", directory, formID]))
 
@@ -163,6 +164,15 @@ export class Queue {
     this.pending.get(id)?.controller.abort()
     this.pending.delete(id)
   }
+  enqueue(id, owner, guard) {
+    this.expire()
+    if (this.seen.has(id)) return false
+    this.remember(id)
+    if (this.pending.size >= 64) return false
+    this.pending.set(id, { id, expires: this.now() + TTL, due: this.now() + 250,
+      owners: new Set([owner]), controller: new AbortController(), attempts: 0, guard })
+    return true
+  }
   accept(event, directory, owner) {
     if (!event || !TYPES.has(event.type)) return false //2.0.41 ignores types options.
     const origin = event.location?.directory ?? "global"
@@ -198,6 +208,9 @@ export class Queue {
     this.running = item
     item.attempts++
     try {
+      // Recheck completion immediately before every attempt, including retries.
+      if (item.guard && !await item.guard()) { this.drop(item.id); return }
+      if (item.controller.signal.aborted || item.expires <= this.now()) return
       const status = await this.sender.send(item, item.controller.signal)
       if (item.controller.signal.aborted) return
       this.report({ event_id: item.id, timestamp: new Date().toISOString(), status })
@@ -211,6 +224,189 @@ export class Queue {
   close() { for (const id of this.pending.keys()) this.drop(id) }
 }
 
+const sessionIDValid = (id) => typeof id === "string" && /^ses_[A-Za-z0-9_-]{1,252}$/.test(id)
+const terminal = new Set(["completed", "cancelled", "error"])
+
+// Read-only snapshots; never store transcripts or forward their contents to FCM.
+// Background tools return completed tool calls with metadata.status=running.
+// Their synthetic completion must have reached the conversation before it is done.
+export function contextBusy(messages) {
+  if (!Array.isArray(messages) || messages.length > 10000) return true
+  const resolvedShells = new Map(), resolvedChildren = new Map()
+  for (const [index, message] of messages.entries()) {
+    if (message.type !== "synthetic" || !terminal.has(message.metadata?.state)) continue
+    if (message.metadata.source === "shell") resolvedShells.set(message.metadata.shellID, index)
+    if (message.metadata.source === "subagent") resolvedChildren.set(message.metadata.childID, index)
+  }
+  return messages.some((message, index) => {
+    if (message.type === "shell") return message.status === "running"
+    if (message.type === "compaction") return message.status === "running"
+    if (message.type !== "assistant") return false
+    if (message.time?.completed == null) return true
+    return message.content?.some((part) => {
+      if (part.type !== "tool") return false
+      if (!part.state || ["running", "streaming"].includes(part.state.status)) return true
+      const metadata = part.state.metadata
+      if (metadata?.status !== "running") return false
+      if (metadata.shellID) return (resolvedShells.get(metadata.shellID) ?? -1) <= index
+      if (metadata.sessionID) return (resolvedChildren.get(metadata.sessionID) ?? -1) <= index
+      return true // Unknown background producer: fail closed.
+    }) ?? true
+  })
+}
+
+export async function completionReady(ctx, sessionID, created, related, blocked) {
+  const root = await ctx.session.get({ sessionID })
+  if (!root || root.id !== sessionID || root.parentID != null || root.outcome !== "succeeded" ||
+      !Number.isFinite(root.time?.idle) || root.time.idle < created) return false
+  const watermark = root.time.idle
+  const todo = [sessionID], visited = new Set()
+  while (todo.length) {
+    const current = todo.shift()
+    if (visited.has(current) || visited.size >= 256) return false
+    visited.add(current)
+    related.add(hash(current))
+    if (blocked(related)) return false
+    const messages = await ctx.session.context({ sessionID: current })
+    if (contextBusy(messages) || messages.at(-1)?.type !== "idle") return false
+    if (current === sessionID) {
+      // Require a conclusive assistant response, not compaction or a bare tool end.
+      const end = messages.length - 1
+      let start = end - 1
+      while (start >= 0 && messages[start].type !== "idle") start--
+      const assistant = messages.slice(start + 1, end).findLast((m) => m.type === "assistant")
+      if (!assistant || assistant.error || assistant.finish !== "stop" ||
+          !assistant.content?.some((part) => part.type === "text" && part.text?.trim())) return false
+    }
+    let cursor
+    const cursors = new Set()
+    do {
+      const page = await ctx.session.list(cursor ? { cursor, limit: 100 } : { parentID: current, limit: 100 })
+      if (!Array.isArray(page?.data) || !page.cursor || page.data.some((child) =>
+        !sessionIDValid(child.id) || child.parentID !== current)) return false
+      todo.push(...page.data.map((child) => child.id))
+      if (todo.length + visited.size > 256) return false
+      cursor = page.cursor.next
+      if (cursor && (typeof cursor !== "string" || cursors.has(cursor))) return false
+      cursors.add(cursor)
+    } while (cursor)
+  }
+  // The terminal event is published during settlement, not after coordinator cleanup.
+  await ctx.session.wait({ sessionID })
+  const final = await ctx.session.get({ sessionID })
+  return !blocked(related) && final?.outcome === "succeeded" && final.time?.idle === watermark
+}
+
+// Completion is an additional server-side trigger, NOT a new Android wire kind.
+// Existing schema1/question remains deliberately unchanged for installed receivers.
+export class Completions {
+  constructor(queue, now = Date.now) {
+    this.queue = queue
+    this.now = now
+    this.candidates = new Map()
+    this.running = new Set()
+    this.inbox = new Map()
+    this.shells = new Map()
+    this.saturated = false
+  }
+  blocked(related) {
+    return this.saturated || [...related].some((id) => this.running.has(id) ||
+      [...this.inbox.values(), ...this.shells.values()].includes(id))
+  }
+  remove(key) {
+    const item = this.candidates.get(key)
+    if (item) this.queue.drop(item.id)
+    this.candidates.delete(key)
+  }
+  accept(event, directory, owner, ctx) {
+    const origin = event?.location?.directory ?? "global"
+    if (typeof origin !== "string" || origin.length > 4096 || (origin !== "global" && origin !== directory)) return
+    const type = event?.type, data = event?.data
+    let sid = data?.sessionID
+    if (type === "shell.created") sid = data?.info?.metadata?.sessionID
+    if (type === "shell.exited" || type === "shell.deleted") {
+      const key = hash(String(data?.id))
+      const session = this.shells.get(key)
+      this.shells.delete(key)
+      this.changed(session)
+      return
+    }
+    if (!sessionIDValid(sid)) return
+    const key = hash(sid)
+    const duplicate = this.candidates.get(key)
+    if (type === EXECUTION + "succeeded" && duplicate?.id === eventID(origin, "completion:" + event.id)) {
+      duplicate.owners.set(owner, ctx)
+      this.queue.pending.get(duplicate.id)?.owners.add(owner)
+      return
+    }
+    if (type === EXECUTION + "started") this.running.add(key)
+    else if (["succeeded", "failed", "interrupted"].some((end) => type === EXECUTION + end)) this.running.delete(key)
+    else if (type === "session.inbox.enqueued") {
+      if (typeof data.inboxID !== "string") return
+      this.inbox.set(hash(data.inboxID), key)
+    } else if (type === "session.inbox.delivered" || type === "session.inbox.cancelled") this.inbox.delete(hash(String(data.inboxID)))
+    else if (type === "shell.created") this.shells.set(hash(String(data.info.id)), key)
+    else return
+    if (Math.max(this.running.size, this.inbox.size, this.shells.size) > 512) {
+      this.saturated = true
+      this.running.clear(); this.inbox.clear(); this.shells.clear()
+    }
+    this.changed(key)
+    if (type !== EXECUTION + "succeeded" || typeof event.id !== "string" ||
+        !/^evt_[A-Za-z0-9_-]{1,252}$/.test(event.id) || !Number.isFinite(event.created)) return
+    const id = eventID(origin, "completion:" + event.id)
+    const existing = this.candidates.get(key)
+    if (existing) this.remove(key)
+    if (this.saturated || this.candidates.size >= 64 || this.queue.seen.has(id)) return
+    this.candidates.set(key, { id, sessionID: sid, created: event.created,
+      owners: new Map([[owner, ctx]]), related: new Set([key]), revision: 0,
+      expires: this.now() + TTL, due: this.now() + 1000, checking: false })
+  }
+  changed(session) {
+    for (const item of this.candidates.values()) {
+      if (!item.related.has(session)) continue
+      this.queue.drop(item.id)
+      item.revision++
+      item.due = this.now() + 1000
+    }
+  }
+  async ready(key, item) {
+    const revision = item.revision
+    const ctx = item.owners.values().next().value
+    if (!ctx) return false
+    const info = await ctx.session.get({ sessionID: item.sessionID })
+    if (info?.parentID != null) { this.remove(key); return false }
+    if (!info || info.outcome !== "succeeded" || !Number.isFinite(info.time?.idle)) return false
+    item.watermark ??= info.time.idle
+    if (info.time.idle !== item.watermark) return false
+    return await completionReady(ctx, item.sessionID, item.created, item.related,
+      (related) => this.blocked(related)) && this.candidates.get(key) === item &&
+      item.revision === revision && item.expires > this.now()
+  }
+  async tick() {
+    for (const [key, item] of this.candidates) {
+      if (item.expires <= this.now()) { this.remove(key); continue }
+      if (item.checking || item.due > this.now()) continue
+      item.checking = true
+      item.due = Infinity // Event-driven rechecks only; never poll a busy conversation.
+      try {
+        if (await this.ready(key, item)) {
+          this.queue.enqueue(item.id, item.owners.keys().next().value, () => this.ready(key, item))
+          const queued = this.queue.pending.get(item.id)
+          if (queued) queued.owners = new Set(item.owners.keys())
+        }
+      } catch {} finally { item.checking = false }
+    }
+  }
+  detach(owner) {
+    for (const [key, item] of this.candidates) {
+      item.owners.delete(owner)
+      if (!item.owners.size) this.remove(key)
+    }
+  }
+  close() { for (const key of this.candidates.keys()) this.remove(key) }
+}
+
 // Tests may inject the metadata reader as a function, never through config options.
 export async function setup(ctx, identityReader = readManagedIdentity) {
     const options = ctx.options ?? {}
@@ -222,7 +418,11 @@ export async function setup(ctx, identityReader = readManagedIdentity) {
     if (!shared) {
       const queue = new Queue(new DirectSender(() => readCredentials(options.credentialFile)),
         (receipt) => console.info(JSON.stringify({ stalker: "direct-fcm", ...receipt })))
-      shared = { queue, owners: new Set(), timer: setInterval(() => void queue.tick(), 100) }
+      const completions = new Completions(queue)
+      shared = { queue, completions, owners: new Set(), timer: setInterval(() => {
+        void completions.tick()
+        void queue.tick()
+      }, 100) }
       globalThis[KEY] = shared
     }
     const owner = Symbol()
@@ -233,10 +433,12 @@ export async function setup(ctx, identityReader = readManagedIdentity) {
       if (closed) return
       closed = true
       controller.abort()
+      shared.completions.detach(owner)
       shared.queue.detach(owner)
       shared.owners.delete(owner)
       if (!shared.owners.size) {
         clearInterval(shared.timer)
+        shared.completions.close()
         shared.queue.close()
         delete globalThis[KEY]
       }
@@ -246,10 +448,11 @@ export async function setup(ctx, identityReader = readManagedIdentity) {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           if (closed) break
           shared.queue.accept(event, ctx.location.directory, owner)
+          shared.completions.accept(event, ctx.location.directory, owner, ctx)
         }
       } catch {} finally { cleanup() }
     })()
-    console.info(JSON.stringify({ stalker: "direct-fcm", state: "subscribed", version: "0.3.2", guard: "managed-v1", pid: process.pid }))
+    console.info(JSON.stringify({ stalker: "direct-fcm", state: "subscribed", version: "0.4.0", guard: "managed-v1", pid: process.pid }))
     return cleanup
 }
 

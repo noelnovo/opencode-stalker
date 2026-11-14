@@ -1,9 +1,9 @@
 {
   "name": "opencode-stalker",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "Direct FCM question-event plugin for OpenCode V2",
+  "description": "Direct FCM question and root-conversation completion plugin for OpenCode V2",
   "exports": { ".": "./plugin/index.mjs" },
   "scripts": { "test": "node --test tests/stalker-plugin.test.mjs" },
   "engines": { "node": ">=24" }

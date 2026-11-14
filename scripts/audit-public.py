@@ -47,7 +47,7 @@ def main():
             raise ValueError("non_regular_source")
         scan(path.read_bytes())
     version = (ROOT / "VERSION").read_text().strip()
-    if version != "0.3.2" or any(json.loads((ROOT / name).read_text())["version"] != version
+    if version != "0.4.0" or any(json.loads((ROOT / name).read_text())["version"] != version
         for name in ["package.json", "plugin/package.json"]):
         raise ValueError("manifest_version_mismatch")
     history = git("rev-list", "--all", "--parents").decode().splitlines()

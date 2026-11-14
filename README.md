@@ -1,11 +1,11 @@
 # OpenCode Stalker
 
 A small OpenCode V2 server plugin that sends a generic Android data message when
-a live question form is created. It publishes directly to Firebase Cloud
+a live question form is created or a main/root conversation finishes. It publishes directly to Firebase Cloud
 Messaging from the OpenCode process: no separate notification subscriber,
 sender service, Unix socket or public callback endpoint.
 
-This repository contains the direct-plugin **0.3.2** source and synthetic tests
+This repository contains the direct-plugin **0.4.0** source and synthetic tests
 only. It targets the OpenCode **2.0.41** plugin contract. It is not an Android app,
 an OpenCode fork, a credential bundle, or an npm release.
 
@@ -14,6 +14,17 @@ an OpenCode fork, a credential bundle, or an npm release.
 - Every Location instance subscribes through `ctx.event.subscribe` in-process.
 - Events are filtered manually: `form.created` with `metadata.kind === "question"`.
   Reply/cancellation events drop queued work.
+- An additional trigger consumes `session.execution.succeeded`, not individual
+  message/tool completion, deprecated idle events, failure or interruption. It
+  reads the session through the public in-process plugin API and rejects every
+  child/subagent (`parentID` present). It requires a final assistant text response
+  with finish reason `stop` followed by the terminal idle marker.
+- Root completion is delayed for one quiet second, checked against descendants,
+  active execution, queued input and managed shell events. Unresolved background
+  shell/subagent results block completion until their synthetic result is handled.
+  Every send/retry rechecks the root idle watermark and waits for execution cleanup.
+  New activity aborts a pending completion send. Child endings can unblock a root,
+  but never generate their own alerts. Checks are event-driven, not busy polling.
 - A process-shared queue handles Location/global duplicates without awaiting
   network operations in the event-consumption loop.
 - Queue: 64 items. Dedup: 512 entries. TTL: at most 300 seconds.
@@ -23,6 +34,30 @@ an OpenCode fork, a credential bundle, or an npm release.
   `event_id`. Android priority is HIGH and the package is restricted.
   `notification` and `android_v2` fields are omitted; the Android app owns
   validation, local display and opt-out.
+
+### Existing Android compatibility
+
+The new event is a **server-side trigger**, not a new receiver protocol. Completion
+reuses the exact existing schema1/`kind: "question"`/opaque `event_id` envelope and
+the same enrolled topic/token, sender, HIGH priority, TTL and package restriction.
+Completion IDs use a separate namespace and the terminal event ID, so a preceding
+question alert does not suppress the completion alert, and later conversation
+turns can notify again. No question is fabricated in OpenCode. No private contents,
+session identifiers, commands or notification text enter the payload.
+
+The installed app therefore displays its **existing generic alert** for both
+triggers; this version does not claim completion-specific Android wording or a
+reply action. The user returns to the existing conversation to reply or finish.
+No APK modification, rebuild, new FCM kind or OS-rendered notification payload is
+needed. FCM acceptance alone is not device-delivery proof.
+
+Completion state is bounded to 64 candidates, 256 descendants per check, 512 active
+execution/inbox/shell entries per category, and a five-minute candidate lifetime.
+Unknown/malformed snapshots, unknown background producers, excessive trees and
+read failures suppress the alert. Activity-state overflow disables completion
+until plugin reload rather than evicting blockers and falsely claiming completion;
+existing question notifications remain independent. Only temporary bounded session
+references and hashes are retained in completion memory, never transcripts.
 
 ## Install safely
 
@@ -193,8 +228,11 @@ running OpenCode server. Guard tests cover changed legitimate PIDs and rejection
 of wrong UID/HOME/cwd/arguments/parent/profile/helper identities. Routing tests
 cover topic/token validation, bounds, disabled/conflicting/duplicate records,
 topic preference with no double-send, generic payload/log suppression, legacy
-quarantine and topic expiration/cancellation. Queue/filter/dedup limits and the
-managed identity implementation remain unchanged.
+quarantine and topic expiration/cancellation. Completion tests additionally cover
+root-only filtering, descendants, background shell/subagent settlement, continuation
+cancellation, pagination, duplicate Locations, retry watermark checks, state bounds
+and fail-closed read errors. The existing question queue, wire format, routing and
+managed identity checks remain compatible.
 
 The publication audit checks the tracked file allowlist, every reachable commit
 and branch, forbidden filenames, private-network/credential patterns and clean
@@ -202,7 +240,13 @@ standalone history. It prints counts/status only, never matching values.
 
 ## Limits
 
-Live-only recovery: initial load, reload gaps and overflow may miss questions.
+Live-only recovery: initial load, reload gaps and overflow may miss alerts.
+Completion refers to OpenCode-managed conversation execution, descendant sessions
+and shell tools, not arbitrary independently detached OS/SSH processes or persistent
+terminal servers. There is no global OS-process-idle claim. Pre-load/reload gaps can
+miss lifecycle events; the snapshot checks reduce but cannot eliminate that gap.
+An unresolved background producer intentionally prevents a completion alert rather
+than guessing that a paused conversation has finished.
 Retries may duplicate an accepted message; an already accepted/in-flight message
 cannot reliably be recalled after settlement. FCM HTTP 200 means Google accepted
 the send, **not** proof of Android receipt. The receiver must validate and dedup.

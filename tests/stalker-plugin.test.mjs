@@ -3,7 +3,8 @@ import assert from "node:assert/strict"
 import { generateKeyPairSync, verify } from "node:crypto"
 import { mkdtemp, writeFile, chmod, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { setup, Queue, DirectSender, message, eventID, readCredentials, selectDevices } from "../plugin/index.mjs"
+import { setup, Queue, DirectSender, message, eventID, readCredentials, selectDevices,
+  Completions, completionReady, contextBusy } from "../plugin/index.mjs"
 import { isManagedServer, readManagedIdentity } from "../plugin/identity.mjs"
 
 const created = (id = "frm_one", directory = "/a", kind = "question") => ({ type: "form.created",
@@ -263,9 +264,174 @@ test("managed setup duplicate instances and safe unload without any network", as
       async *[Symbol.asyncIterator]() { await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true })) }
     }) } })
   const denied = await setup(ctx("/a"), async () => ({ ...identity(), cwd: "/fixture" }))
-  denied(); assert.equal(globalThis[Symbol.for("downops.stalker.direct.v1")], undefined)
+  denied(); assert.equal(globalThis[Symbol.for("downops.stalker.direct.v2")], undefined)
   const one = await setup(ctx("/a"), async () => identity()), two = await setup(ctx("/b"), async () => identity(7001))
-  const shared = globalThis[Symbol.for("downops.stalker.direct.v1")]
+  const shared = globalThis[Symbol.for("downops.stalker.direct.v2")]
   assert.equal(shared.owners.size, 2); one(); one(); assert.equal(shared.owners.size, 1)
-  two(); assert.equal(globalThis[Symbol.for("downops.stalker.direct.v1")], undefined)
+  two(); assert.equal(globalThis[Symbol.for("downops.stalker.direct.v2")], undefined)
+})
+
+const execution = (type = "succeeded", sessionID = "ses_root", id = "evt_done", directory = "/a") => ({
+  type: "session.execution." + type, id, created: 900, location: { directory }, data: { sessionID } })
+const answer = () => ({ type: "assistant", finish: "stop", time: { completed: 900 },
+  content: [{ type: "text", text: "PRIVATE FINAL ANSWER" }] })
+const idle = () => ({ type: "idle", outcome: "succeeded" })
+const completionFixture = () => {
+  const f = fixture()
+  const infos = new Map([["ses_root", { id: "ses_root", outcome: "succeeded", time: { idle: 900 } }]])
+  const histories = new Map([["ses_root", [answer(), idle()]]])
+  const children = new Map(), calls = []
+  const ctx = { session: {
+    get: async ({ sessionID }) => { calls.push("get"); return infos.get(sessionID) },
+    context: async ({ sessionID }) => { calls.push("context"); return histories.get(sessionID) },
+    list: async ({ parentID }) => ({ data: children.get(parentID) ?? [], cursor: {} }),
+    wait: async () => { calls.push("wait") },
+  } }
+  const c = new Completions(f.q, f.q.now)
+  const accept = (event, owner = 1, directory = "/a", context = ctx) => c.accept(event, directory, owner, context)
+  return { ...f, c, infos, histories, children, calls, ctx, accept }
+}
+test("one root completion uses the existing payload and opaque independent event ID", async () => {
+  const f = completionFixture()
+  f.accept(execution()); f.advance(999); await f.c.tick(); assert.equal(f.q.pending.size, 0)
+  f.advance(1); await f.c.tick(); assert.equal(f.q.pending.size, 1)
+  const item = [...f.q.pending.values()][0]
+  assert.notEqual(item.id, eventID("/a", "evt_done"))
+  const payload = message({ topic }, item.id, item.expires, f.q.now())
+  assert.equal(payload.message.data.kind, "question") // Installed APK compatibility, not a new receiver kind.
+  assert.equal(JSON.stringify(payload).includes("PRIVATE"), false)
+  assert.equal(JSON.stringify([...f.q.pending.values()]).includes("ses_root"), false)
+  f.advance(250); await f.q.tick(); assert.equal(f.sent.length, 1)
+  f.accept(execution()); f.advance(2000); await f.c.tick(); await f.q.tick()
+  assert.equal(f.sent.length, 1)
+})
+test("subagent success, temporary idle, failures, interruption, compaction and tool-only endings do not notify", async () => {
+  for (const variant of ["child", "idle", "failed", "interrupted", "compaction", "tool", "error"]) {
+    const f = completionFixture()
+    if (variant === "child") f.infos.get("ses_root").parentID = "ses_parent"
+    if (variant === "compaction") f.histories.set("ses_root", [{ type: "compaction", status: "completed" }, idle()])
+    if (variant === "tool") f.histories.set("ses_root", [{ ...answer(), finish: "tool-calls" }, idle()])
+    if (variant === "error") f.histories.set("ses_root", [{ ...answer(), error: {} }, idle()])
+    f.accept(variant === "idle" ? { ...execution(), type: "session.status", data: { sessionID: "ses_root", status: { type: "idle" } } } :
+      execution(["failed", "interrupted"].includes(variant) ? variant : "succeeded"))
+    f.advance(2000); await f.c.tick(); await f.q.tick()
+    assert.equal(f.sent.length, 0, variant); assert.equal(f.q.pending.size, 0, variant)
+    if (variant === "child") assert.equal(f.c.candidates.size, 0)
+  }
+})
+test("main conversation continuation cancels queued and in-flight completion work", async () => {
+  for (const type of ["session.execution.started", "session.inbox.enqueued"]) {
+    const f = completionFixture()
+    f.accept(execution()); f.advance(1000); await f.c.tick(); assert.equal(f.q.pending.size, 1)
+    const item = [...f.q.pending.values()][0]
+    f.accept({ ...execution(), type, data: { sessionID: "ses_root", inboxID: "msg_next" } })
+    assert.equal(item.controller.signal.aborted, true)
+    f.advance(2000); await f.c.tick(); await f.q.tick(); assert.equal(f.sent.length, 0)
+    f.accept(execution("succeeded", "ses_root", "evt_next"))
+    if (type === "session.inbox.enqueued") f.accept({ ...execution(), type: "session.inbox.delivered", data: { sessionID: "ses_root", inboxID: "msg_next" } })
+    f.advance(1000); await f.c.tick(); f.advance(250); await f.q.tick(); assert.equal(f.sent.length, 1)
+  }
+})
+test("global duplicates retain all owners and unloading one Location preserves completion", async () => {
+  const f = completionFixture(), event = execution(); delete event.location
+  f.accept(event); f.advance(1000); await f.c.tick()
+  f.accept(event, 2, "/b")
+  assert.equal(f.q.pending.size, 1)
+  assert.equal([...f.q.pending.values()][0].owners.size, 2)
+  f.c.detach(1); f.q.detach(1)
+  f.advance(250); await f.q.tick(); assert.equal(f.sent.length, 1)
+  f.c.detach(2); assert.equal(f.c.candidates.size, 0)
+})
+test("active child and grandchild block the root without generating child alerts", async () => {
+  const f = completionFixture()
+  f.children.set("ses_root", [{ id: "ses_child", parentID: "ses_root" }])
+  f.children.set("ses_child", [{ id: "ses_grandchild", parentID: "ses_child" }])
+  f.histories.set("ses_child", [answer(), idle()]); f.histories.set("ses_grandchild", [answer()])
+  f.infos.set("ses_grandchild", { id: "ses_grandchild", parentID: "ses_child" })
+  f.accept(execution()); f.advance(1000); await f.c.tick(); assert.equal(f.q.pending.size, 0)
+  f.histories.set("ses_grandchild", [answer(), idle()])
+  f.accept(execution("succeeded", "ses_grandchild", "evt_grandchild"))
+  f.advance(1000); await f.c.tick(); f.advance(250); await f.q.tick()
+  assert.equal(f.sent.length, 1)
+})
+test("background shell waits for process exit AND its result being handled by the main conversation", async () => {
+  const f = completionFixture()
+  const tool = { ...answer(), content: [{ type: "tool", state: { status: "completed",
+    metadata: { status: "running", shellID: "sh_background" } } }] }
+  f.histories.set("ses_root", [tool, answer(), idle()])
+  f.accept({ type: "shell.created", location: { directory: "/a" }, data: {
+    info: { id: "sh_background", metadata: { sessionID: "ses_root" }, command: "PRIVATE COMMAND" } } })
+  f.accept(execution()); f.advance(1000); await f.c.tick(); assert.equal(f.q.pending.size, 0)
+  f.accept({ type: "shell.exited", location: { directory: "/a" }, data: { id: "sh_background" } })
+  f.advance(1000); await f.c.tick(); assert.equal(f.q.pending.size, 0)
+  f.histories.set("ses_root", [tool, idle(), { type: "synthetic", metadata: {
+    source: "shell", shellID: "sh_background", state: "completed" } }, answer(), idle()])
+  f.accept(execution("started", "ses_root", "evt_resumed"))
+  f.accept(execution("succeeded", "ses_root", "evt_final"))
+  f.advance(1000); await f.c.tick(); f.advance(250); await f.q.tick()
+  assert.equal(f.sent.length, 1)
+})
+test("background subagent notification must be delivered, not merely a completed child snapshot", () => {
+  const tool = { ...answer(), content: [{ type: "tool", state: { status: "completed",
+    metadata: { status: "running", sessionID: "ses_child" } } }] }
+  assert.equal(contextBusy([tool, answer(), idle()]), true)
+  assert.equal(contextBusy([tool, { type: "synthetic", metadata: { source: "subagent", childID: "ses_child", state: "completed" } }, answer(), idle()]), false)
+  assert.equal(contextBusy([tool, { type: "synthetic", metadata: { source: "subagent", childID: "ses_child", state: "completed" } }, idle(), tool, answer(), idle()]), true)
+  for (const message of [{ type: "shell", status: "running" }, { type: "compaction", status: "running" },
+    { ...answer(), time: {} }, { ...answer(), content: [{ type: "tool", state: { status: "running" } }] },
+    { ...answer(), content: [{ type: "tool", state: { status: "completed", metadata: { status: "running" } } }] }]) {
+    assert.equal(contextBusy([message]), true)
+  }
+})
+test("completion retry rechecks the snapshot and cannot send an obsolete watermark", async () => {
+  const f = completionFixture(); let calls = 0
+  f.q.sender = { send: async () => { calls++; return 503 } }
+  f.accept(execution()); f.advance(1000); await f.c.tick(); f.advance(250); await f.q.tick()
+  assert.equal(calls, 1)
+  f.infos.get("ses_root").time.idle = 901
+  f.advance(500); await f.q.tick(); assert.equal(calls, 1); assert.equal(f.q.pending.size, 0)
+})
+test("unknown, malformed, missing and cross-location snapshots fail closed; no transcript data retained", async () => {
+  for (const variant of ["location", "id", "created", "missing", "throws", "list", "cursor", "busy"]) {
+    const f = completionFixture(), event = execution()
+    if (variant === "location") event.location.directory = "/b"
+    if (variant === "id") event.id = "INVALID"
+    if (variant === "created") delete event.created
+    if (variant === "missing") f.infos.clear()
+    if (variant === "throws") f.ctx.session.get = async () => { throw new Error("PRIVATE") }
+    if (variant === "list") f.ctx.session.list = async () => ({ data: null, cursor: {} })
+    if (variant === "cursor") f.ctx.session.list = async () => ({ data: [], cursor: { next: "same" } })
+    if (variant === "busy") f.histories.set("ses_root", [answer()])
+    f.accept(event); f.advance(1000); await f.c.tick(); f.advance(250); await f.q.tick()
+    assert.equal(f.sent.length, 0, variant)
+    assert.equal(JSON.stringify([...f.c.candidates.values()]).includes("PRIVATE"), false)
+  }
+})
+test("pagination covers descendants and cyclic/oversized trees fail closed", async () => {
+  const f = completionFixture(), related = new Set()
+  let pages = 0
+  f.ctx.session.list = async ({ parentID, cursor }) => {
+    pages++
+    if (parentID === "ses_root") return { data: [], cursor: { next: "second" } }
+    if (cursor === "second") return { data: [{ id: "ses_child", parentID: "ses_root" }], cursor: {} }
+    return { data: [], cursor: {} }
+  }
+  f.histories.set("ses_child", [answer(), idle()])
+  assert.equal(await completionReady(f.ctx, "ses_root", 900, related, () => false), true)
+  assert.equal(pages, 3); assert.equal(related.size, 2)
+  f.ctx.session.list = async ({ parentID }) => ({ data: [{ id: "ses_root", parentID }], cursor: {} })
+  assert.equal(await completionReady(f.ctx, "ses_root", 900, new Set(), () => false), false)
+})
+test("candidate TTL, capacity, state overflow, cleanup, and event-driven rechecks are bounded", async () => {
+  const f = completionFixture()
+  for (let n = 0; n < 100; n++) f.accept(execution("succeeded", "ses_" + n, "evt_" + n))
+  assert.equal(f.c.candidates.size, 64)
+  f.advance(300001); await f.c.tick(); assert.equal(f.c.candidates.size, 0)
+  f.accept(execution()); f.advance(1000); f.infos.clear(); await f.c.tick()
+  const calls = f.calls.length
+  for (let n = 0; n < 5; n++) { f.advance(1000); await f.c.tick() }
+  assert.equal(f.calls.length, calls)
+  for (let n = 0; n < 513; n++) f.accept(execution("started", "ses_" + n, "evt_" + n))
+  assert.equal(f.c.saturated, true)
+  f.c.close(); f.q.close(); assert.equal(f.c.candidates.size, 0); assert.equal(f.q.pending.size, 0)
 })
